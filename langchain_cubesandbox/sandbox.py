@@ -249,6 +249,10 @@ class CubeSandbox(BaseSandbox):
         responses = []
 
         for path, content in files:
+            # 新增：拒绝相对路径
+            if not path.startswith("/"):
+                responses.append(FileUploadResponse(path=path, error="invalid_path"))
+                continue
             try:
                 self._sandbox.files.write(
                     path,
@@ -276,8 +280,15 @@ class CubeSandbox(BaseSandbox):
 
         responses = []
         for path in paths:
+            # 新增：拒绝相对路径
+            if not path.startswith("/"):
+                responses.append(
+                    FileDownloadResponse(path=path, content=None, error="invalid_path")
+                )
+                continue
             try:
-                content = self._sandbox.files.read(path)
+                # 优先用 bytes 格式读取（二进制安全，也能读文本）
+                content = self._sandbox.files.read(path, format="bytes")
                 # E2B SDK 返回 str，需编码为 bytes
                 if isinstance(content, str):
                     content = content.encode("utf-8")
@@ -286,9 +297,35 @@ class CubeSandbox(BaseSandbox):
                 )
             except Exception as e:
                 err = str(e)
-                if "not_found" in err.lower() or "invalid_path" in err.lower():
+                # 按异常类型映射到标准错误码
+                err_lower = err.lower()
+                if (
+                    "does not exist" in err_lower
+                    or "not found" in err_lower
+                    or "no such file" in err_lower
+                ):
                     responses.append(
-                        FileDownloadResponse(path=path, content=b"", error=err)
+                        FileDownloadResponse(
+                            path=path, content=None, error="file_not_found"
+                        )
+                    )
+                elif "is a directory" in err_lower:
+                    responses.append(
+                        FileDownloadResponse(
+                            path=path, content=None, error="is_directory"
+                        )
+                    )
+                elif "permission denied" in err_lower:
+                    responses.append(
+                        FileDownloadResponse(
+                            path=path, content=None, error="permission_denied"
+                        )
+                    )
+                elif "invalid" in err_lower or "relative" in err_lower:
+                    responses.append(
+                        FileDownloadResponse(
+                            path=path, content=None, error="invalid_path"
+                        )
                     )
                 else:
                     raise
