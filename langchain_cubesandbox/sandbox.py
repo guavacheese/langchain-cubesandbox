@@ -1,5 +1,7 @@
 from __future__ import annotations
 import os
+import ssl
+from typing import Any
 
 from deepagents.backends.protocol import (
     ExecuteResponse,
@@ -9,7 +11,11 @@ from deepagents.backends.protocol import (
 
 from deepagents.backends.sandbox import BaseSandbox
 
-from e2b_code_interpreter import Sandbox
+from e2b_code_interpreter import (
+    Sandbox,
+    SandboxQuery,
+    SandboxState,
+)
 
 
 # CubeSandbox 原生兼容 E2B SDK;
@@ -21,6 +27,12 @@ class CubeSandbox(BaseSandbox):
 
     利用 CubeSandbox 的 E2B 兼容层，将硬件级隔离的 MicroVM
     接入 LangChain 生态。冷启动 <60ms，单实例内存开销 <5MB。
+
+    支持：
+    - metadata（存 thread_id 等上下文）
+    - timeout / 续期
+    - pause / resume
+    - get-or-create 模式复用沙箱
     """
 
     def __init__(
@@ -29,9 +41,10 @@ class CubeSandbox(BaseSandbox):
         api_url: str | None = None,
         api_key: str | None = None,
         ssl_cert: str | None = None,
-        timeout: int = 60,
-        # proxy_ip: str | None = None,
-        # proxy_port: int = 80,
+        metadata: dict[str, str] | None = None,
+        timeout: int | None = None,
+        auto_pause: bool = True,
+        timeout_on_refresh: int = 300,
     ) -> None:
         # CubeSandbox 通过环境变量拦截 E2B SDK 请求
         if api_url:
@@ -40,16 +53,145 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_KEY"] = api_key
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
+        else:
+            # 没有SSL_CERT时跳过证书验证（开发环境用）
+            ssl._create_default_https_context = ssl._create_unverified_context
 
-        self._template_id = template
+        self._template = template
         self._timeout = timeout
+        self._timeout_on_refresh = timeout_on_refresh
+        self._auto_pause = auto_pause
 
-        # 创建 Sandbox 时注入自定义 httpx client
-        self._sandbox = Sandbox.create(template=template)
+        # 传给SDK的kwargs
+        create_kwargs: dict[str, Any] = {"template": template}
+        if metadata:
+            create_kwargs["metadata"] = metadata
+        if timeout is not None:
+            create_kwargs["timeout"] = timeout
+
+        self._sandbox = Sandbox.create(**create_kwargs)
+
+    @classmethod
+    def connect(
+        cls,
+        sandbox_id: str,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        ssl_cert: str | None = None,
+        timeout: int | None = None,
+        timeout_on_refresh: int = 300,
+    ) -> "CubeSandbox":
+        """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
+        # 先用一个临时沙箱获取连接
+        instance = cls.__new__(cls)
+        instance._timeout_on_refresh = timeout_on_refresh
+        instance._auto_pause = True
+        instance._template = ""
+
+        if api_url:
+            os.environ["E2B_API_URL"] = api_url
+        if api_key:
+            os.environ["E2B_API_KEY"] = api_key
+        if ssl_cert:
+            os.environ["SSL_CERT_FILE"] = ssl_cert
+        else:
+            ssl._create_default_https_context = ssl._create_unverified_context
+
+        instance._sandbox = Sandbox.connect(sandbox_id, timeout=timeout)
+        return instance
+
+    @classmethod
+    def list(
+        cls,
+        metadata: dict[str, str] | None = None,
+        state: str | None = None,
+    ) -> list[dict]:
+
+        query_kwargs = {}
+        if metadata:
+            query_kwargs["metadata"] = metadata
+        if state:
+            query_kwargs["state"] = [SandboxState(state)]
+
+        query = SandboxQuery(**query_kwargs) if query_kwargs else None
+        paginator = Sandbox.list(query=query)
+
+        items = []
+        while paginator.has_next:
+            items.extend(paginator.next_items())
+
+        return [
+            {
+                "id": s.sandbox_id,
+                "metadata": s.metadata,
+                "state": s.state.value,
+                "started_at": str(s.started_at),
+                "end_at": str(s.end_at),
+            }
+            for s in items
+        ]
+
+    @staticmethod
+    def get_or_create(
+        template: str,
+        thread_id: str,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        ssl_cert: str | None = None,
+        timeout: int = 300,
+    ) -> "CubeSandbox":
+        """
+        每次调用都创建新沙箱（带 thread_id 作为 metadata）。
+        如果需要复用已有沙箱，外部自行管理 sandbox_id → thread_id 的映射。
+        """
+        if api_url:
+            os.environ["E2B_API_URL"] = api_url
+        if api_key:
+            os.environ["E2B_API_KEY"] = api_key
+        if ssl_cert:
+            os.environ["SSL_CERT_FILE"] = ssl_cert
+        else:
+            ssl._create_default_https_context = ssl._create_unverified_context
+
+        return CubeSandbox(
+            template=template,
+            api_url=api_url,
+            api_key=api_key,
+            ssl_cert=ssl_cert,
+            metadata={"thread_id": thread_id},
+            timeout=timeout,
+        )
 
     @property
     def id(self) -> str:
-        return self._sandbox.id
+        return self._sandbox.sandbox_id
+
+    @property
+    def sandbox_id(self) -> str:
+        """别名，方便调试。"""
+        return self._sandbox.sandbox_id
+
+    # ─── TTL 管理 ───
+
+    def set_timeout(self, seconds: int) -> None:
+        """设置超时时间（秒），超时后沙箱自动销毁。"""
+        self._sandbox.set_timeout(seconds)
+
+    def refresh_timeout(self) -> None:
+        """续期 TTL（默认 300 秒 = 5 分钟）。"""
+        self._sandbox.set_timeout(self._timeout_on_refresh)
+
+    # ─── Pause / Resume ───
+
+    def pause(self) -> None:
+        """暂停沙箱（释放 CPU/内存资源，保留磁盘状态）。"""
+        self._sandbox.pause()
+
+    def resume(self) -> None:
+        """恢复已暂停的沙箱。"""
+        self._sandbox.resume()
+
+    # ─── 代码执行 ───
 
     def execute(
         self,
@@ -59,10 +201,16 @@ class CubeSandbox(BaseSandbox):
     ) -> ExecuteResponse:
         """执行 shell 命令，映射到 CubeSandbox MicroVM 内。"""
         try:
+            # 尝试续期 TTL，失败也不影响代码执行
+            try:
+                self.refresh_timeout()
+            except Exception:
+                pass  # CubeMaster 可能还没实现 timeout 接口
+
             # 标准 E2B SDK 的 shell 命令执行入口
             result = self._sandbox.commands.run(
                 command,
-                timeout=timeout or self._timeout,
+                timeout=timeout or self._timeout_on_refresh,
             )
 
             output = result.stdout or ""
@@ -82,6 +230,16 @@ class CubeSandbox(BaseSandbox):
                 exit_code=1,
                 truncated=False,
             )
+
+    def run_code(self, code: str, *, timeout: int | None = None):
+        """运行 Python等 代码（直接转 E2B SDK 的 run_code）。"""
+        try:
+            self.refresh_timeout()
+        except Exception:
+            pass
+        return self._sandbox.run_code(code, timeout=timeout)
+
+    # ─── 文件操作 ───
 
     def upload_files(
         self,
@@ -136,7 +294,8 @@ class CubeSandbox(BaseSandbox):
                     raise
         return responses
 
-    # --- Async variants ---
+    # ─── Async ───
+
     async def aexecute(
         self,
         command: str,
@@ -158,6 +317,8 @@ class CubeSandbox(BaseSandbox):
         paths: list[str],
     ) -> list[FileDownloadResponse]:
         return self.download_files(paths)
+
+    # ─── 资源释放 ───
 
     def close(self) -> None:
         """显式关闭 CubeSandbox MicroVM 实例，释放资源。"""
