@@ -46,7 +46,15 @@ class CubeSandbox(BaseSandbox):
         auto_pause: bool = True,
         timeout_on_refresh: int = 300,
     ) -> None:
-        # CubeSandbox 通过环境变量拦截 E2B SDK 请求
+        # 1. 预初始化所有属性，防止 __del__ 崩溃
+        self._sandbox = None
+        self._template = template
+        self._timeout = timeout
+        self._timeout_on_refresh = timeout_on_refresh
+        self._auto_pause = auto_pause
+        self._closed = False
+
+        # 2. CubeSandbox 通过环境变量拦截 E2B SDK 请求
         if api_url:
             os.environ["E2B_API_URL"] = api_url
         if api_key:
@@ -55,19 +63,14 @@ class CubeSandbox(BaseSandbox):
             os.environ["SSL_CERT_FILE"] = ssl_cert
         else:
             # 没有SSL_CERT时跳过证书验证（开发环境用）
-            ssl._create_default_https_context = ssl._create_unverified_context
-
-        self._template = template
-        self._timeout = timeout
-        self._timeout_on_refresh = timeout_on_refresh
-        self._auto_pause = auto_pause
+            os.environ["E2B_DEBUG"] = "true"
 
         # 传给SDK的kwargs
         create_kwargs: dict[str, Any] = {"template": template}
         if metadata:
             create_kwargs["metadata"] = metadata
-        if timeout is not None:
-            create_kwargs["timeout"] = timeout
+        # if timeout is not None:
+        #     create_kwargs["timeout"] = timeout
 
         self._sandbox = Sandbox.create(**create_kwargs)
 
@@ -84,9 +87,14 @@ class CubeSandbox(BaseSandbox):
         """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
         # 先用一个临时沙箱获取连接
         instance = cls.__new__(cls)
+
+        # 预初始化所有属性，保持一致性
+        instance._sandbox = None
+        instance._template = ""
+        instance._timeout = timeout
         instance._timeout_on_refresh = timeout_on_refresh
         instance._auto_pause = True
-        instance._template = ""
+        instance._closed = False
 
         if api_url:
             os.environ["E2B_API_URL"] = api_url
@@ -97,8 +105,13 @@ class CubeSandbox(BaseSandbox):
         else:
             ssl._create_default_https_context = ssl._create_unverified_context
 
-        instance._sandbox = Sandbox.connect(sandbox_id, timeout=timeout)
-        return instance
+        try:
+            instance._sandbox = Sandbox.connect(sandbox_id, timeout=timeout)
+            return instance
+        except Exception:
+            # 如果失败，清理半成品对象
+            instance._closed = True
+            raise
 
     @classmethod
     def list(
@@ -138,7 +151,7 @@ class CubeSandbox(BaseSandbox):
         api_url: str | None = None,
         api_key: str | None = None,
         ssl_cert: str | None = None,
-        timeout: int = 300,
+        # timeout: int = 300,
     ) -> "CubeSandbox":
         """
         每次调用都创建新沙箱（带 thread_id 作为 metadata）。
@@ -151,15 +164,37 @@ class CubeSandbox(BaseSandbox):
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
         else:
-            ssl._create_default_https_context = ssl._create_unverified_context
+            os.environ["E2B_DEBUG"] = "true"
 
+        # 先查找已有的沙箱
+        metadata_filter = {"thread_id": thread_id}
+        try:
+            existing = CubeSandbox.list(
+                metadata=metadata_filter,
+                state="running",
+            )
+        except Exception:
+            existing = []
+
+        if existing:
+            # 复用已有沙箱
+            sandbox_id = existing[0]["id"]
+            return CubeSandbox.connect(
+                sandbox_id=sandbox_id,
+                api_url=api_url,
+                api_key=api_key,
+                ssl_cert=ssl_cert,
+                # timeout=timeout,
+            )
+
+        # 否则创建新的
         return CubeSandbox(
             template=template,
             api_url=api_url,
             api_key=api_key,
             ssl_cert=ssl_cert,
             metadata={"thread_id": thread_id},
-            timeout=timeout,
+            # timeout=timeout,
         )
 
     @property
@@ -175,7 +210,13 @@ class CubeSandbox(BaseSandbox):
 
     def set_timeout(self, seconds: int) -> None:
         """设置超时时间（秒），超时后沙箱自动销毁。"""
-        self._sandbox.set_timeout(seconds)
+        self._timeout = seconds
+
+        # 可选：如果后端未来支持，再调用
+        # try:
+        #     self._sandbox.set_timeout(seconds)
+        # except Exception:
+        #     pass
 
     def refresh_timeout(self) -> None:
         """续期 TTL（默认 300 秒 = 5 分钟）。"""
@@ -359,10 +400,20 @@ class CubeSandbox(BaseSandbox):
 
     def close(self) -> None:
         """显式关闭 CubeSandbox MicroVM 实例，释放资源。"""
-        if hasattr(self._sandbox, "close"):
-            self._sandbox.close()
-        elif hasattr(self._sandbox, "kill"):
-            self._sandbox.kill()
+        if self._closed:
+            return
+
+        sandbox = getattr(self, "_sandbox", None)
+        if sandbox is not None:
+            if hasattr(sandbox, "close"):
+                sandbox.close()
+            elif hasattr(sandbox, "kill"):
+                sandbox.kill()
+
+        self._closed = True
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass  # 析构时禁止任何异常逃逸
