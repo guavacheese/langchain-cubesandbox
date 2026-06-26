@@ -18,6 +18,12 @@ from e2b_code_interpreter import (
 )
 
 
+def _metadata_may_mismatch(value: str) -> bool:
+    """CubeAPI filter_by_metadata 不做 URL-decode。
+    当 value 含 URL 特殊字符（:, %, &, = 等）时，服务端过滤可能漏掉。"""
+    return any(c in value for c in (":", "%", "&", "="))
+
+
 # CubeSandbox 原生兼容 E2B SDK;
 # LangChain 的 BaseSandbox 已经通过 python3 内置实现了文件系统工具（ls, read, write, edit, glob, grep）。
 # 需要实现 execute()、upload_files()、download_files()、id 及对应的 async 方法。
@@ -166,15 +172,35 @@ class CubeSandbox(BaseSandbox):
         else:
             os.environ["E2B_DEBUG"] = "true"
 
-        # 先查找已有的沙箱
-        metadata_filter = {"thread_id": thread_id}
-        try:
-            existing = CubeSandbox.list(
-                metadata=metadata_filter,
-                state="running",
-            )
-        except Exception:
-            existing = []
+        # 先查找已有的沙箱 —— 通过 metadata filter
+        #   CubeAPI 的 filter_by_metadata 不会 URL-decode metadata value，
+        #   当 thread_id 含 `:` 等特殊字符时可能查不到。加了 client-side fallback。
+        def _find_by_metadata() -> list[dict]:
+            try:
+                return CubeSandbox.list(
+                    metadata={"thread_id": thread_id},
+                    state="running",
+                )
+            except Exception:
+                return []
+
+        def _find_client_side() -> list[dict]:
+            """回退：列出所有 running 沙箱，在客户端按 thread_id 过滤。"""
+            try:
+                all_sbs = CubeSandbox.list(state="running")
+            except Exception:
+                return []
+            return [
+                sb
+                for sb in all_sbs
+                if (sb.get("metadata") or {}).get("thread_id") == thread_id
+            ]
+
+        existing = _find_by_metadata()
+
+        # 服务端 metadata 过滤有空窗期 → client-side 兜底
+        if not existing and _metadata_may_mismatch(thread_id):
+            existing = _find_client_side()
 
         if existing:
             # 复用已有沙箱
