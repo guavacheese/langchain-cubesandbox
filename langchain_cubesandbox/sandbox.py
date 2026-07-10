@@ -123,14 +123,17 @@ class CubeSandbox(BaseSandbox):
     def list(
         cls,
         metadata: dict[str, str] | None = None,
-        state: str | None = None,
+        state: str | list[str] | None = None,
     ) -> list[dict]:
 
         query_kwargs = {}
         if metadata:
             query_kwargs["metadata"] = metadata
         if state:
-            query_kwargs["state"] = [SandboxState(state)]
+            if isinstance(state, str):
+                query_kwargs["state"] = [SandboxState(state)]
+            else:
+                query_kwargs["state"] = [SandboxState(s) for s in state]
 
         query = SandboxQuery(**query_kwargs) if query_kwargs else None
         paginator = Sandbox.list(query=query)
@@ -175,19 +178,19 @@ class CubeSandbox(BaseSandbox):
         # 先查找已有的沙箱 —— 通过 metadata filter
         #   CubeAPI 的 filter_by_metadata 不会 URL-decode metadata value，
         #   当 thread_id 含 `:` 等特殊字符时可能查不到。加了 client-side fallback。
-        def _find_by_metadata() -> list[dict]:
+        def _find_by_metadata(state_filter: str | list[str] = "running") -> list[dict]:
             try:
                 return CubeSandbox.list(
                     metadata={"thread_id": thread_id},
-                    state="running",
+                    state=state_filter,
                 )
             except Exception:
                 return []
 
-        def _find_client_side() -> list[dict]:
-            """回退：列出所有 running 沙箱，在客户端按 thread_id 过滤。"""
+        def _find_client_side(state_filter: str | list[str] = "running") -> list[dict]:
+            """回退：列出所有沙箱，在客户端按 thread_id 过滤。"""
             try:
-                all_sbs = CubeSandbox.list(state="running")
+                all_sbs = CubeSandbox.list(state=state_filter)
             except Exception:
                 return []
             return [
@@ -196,11 +199,12 @@ class CubeSandbox(BaseSandbox):
                 if (sb.get("metadata") or {}).get("thread_id") == thread_id
             ]
 
-        existing = _find_by_metadata()
+        # Step 1: 先找 running 的
+        existing = _find_by_metadata("running")
 
         # 服务端 metadata 过滤有空窗期 → client-side 兜底
         if not existing and _metadata_may_mismatch(thread_id):
-            existing = _find_client_side()
+            existing = _find_client_side("running")
 
         if existing:
             # 复用已有沙箱
@@ -210,10 +214,33 @@ class CubeSandbox(BaseSandbox):
                 api_url=api_url,
                 api_key=api_key,
                 ssl_cert=ssl_cert,
-                # timeout=timeout,
             )
 
-        # 否则创建新的
+        # Step 2: running 没找到，查 paused 沙箱
+        paused = _find_by_metadata("paused")
+        if not paused and _metadata_may_mismatch(thread_id):
+            paused = _find_client_side("paused")
+
+        if paused:
+            sandbox_id = paused[0]["id"]
+            try:
+                sb = CubeSandbox.connect(
+                    sandbox_id=sandbox_id,
+                    api_url=api_url,
+                    api_key=api_key,
+                    ssl_cert=ssl_cert,
+                )
+                # 尝试恢复暂停的沙箱（如果 connect 成功但沙箱仍处于 paused 状态）
+                try:
+                    sb.resume()
+                except Exception:
+                    pass
+                return sb
+            except Exception:
+                # connect/resume 失败，fall through 创建新的
+                pass
+
+        # Step 3: 都没有，创建新的
         return CubeSandbox(
             template=template,
             api_url=api_url,
