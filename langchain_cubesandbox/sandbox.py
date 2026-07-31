@@ -68,8 +68,11 @@ class CubeSandbox(BaseSandbox):
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
         else:
-            # 没有SSL_CERT时跳过证书验证（开发环境用）
-            os.environ["E2B_DEBUG"] = "true"
+            # 修复：不要设 E2B_DEBUG=true！
+            # 它会让 SDK 进入 debug 模式，不创建真实沙箱，
+            # sandbox_id 变成假的 "debug_sandbox_id"，执行请求全部 Connection refused。
+            # 跳过证书验证应改用 ssl 上下文：
+            ssl._create_default_https_context = ssl._create_unverified_context
 
         # 传给SDK的kwargs
         create_kwargs: dict[str, Any] = {"template": template}
@@ -173,7 +176,9 @@ class CubeSandbox(BaseSandbox):
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
         else:
-            os.environ["E2B_DEBUG"] = "true"
+            # 修复：不要设 E2B_DEBUG=true！会让 SDK 进入 debug 模式返回假 sandbox_id。
+            # 与 __init__/connect 保持一致，用 ssl 上下文跳过证书验证。
+            ssl._create_default_https_context = ssl._create_unverified_context
 
         # 先查找已有的沙箱 —— 通过 metadata filter
         #   CubeAPI 的 filter_by_metadata 不会 URL-decode metadata value，
