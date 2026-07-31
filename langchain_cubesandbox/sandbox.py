@@ -1,6 +1,5 @@
 from __future__ import annotations
 import os
-import ssl
 from typing import Any
 
 from deepagents.backends.protocol import (
@@ -67,12 +66,10 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_KEY"] = api_key
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
-        else:
-            # 修复：不要设 E2B_DEBUG=true！
-            # 它会让 SDK 进入 debug 模式，不创建真实沙箱，
-            # sandbox_id 变成假的 "debug_sandbox_id"，执行请求全部 Connection refused。
-            # 跳过证书验证应改用 ssl 上下文：
-            ssl._create_default_https_context = ssl._create_unverified_context
+        # 注意：不要设 E2B_DEBUG=true！会让 SDK 进入 debug 模式返回假 sandbox_id。
+        # 也不要 monkeypatch ssl._create_default_https_context——它只对 http.client/urllib 生效，
+        # e2b 用的 httpx/httpcore 直接调用 ssl.create_default_context()，替换无效。
+        # 证书验证靠 .env 的 SSL_CERT_FILE 指向内部 CA（或公网合法证书）。
 
         # 传给SDK的kwargs
         create_kwargs: dict[str, Any] = {"template": template}
@@ -111,8 +108,7 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_KEY"] = api_key
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
-        else:
-            ssl._create_default_https_context = ssl._create_unverified_context
+        # 与 __init__ 一致：不设 E2B_DEBUG、不 monkeypatch ssl（对 httpx/httpcore 无效）。
 
         try:
             instance._sandbox = Sandbox.connect(sandbox_id, timeout=timeout)
@@ -175,10 +171,7 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_KEY"] = api_key
         if ssl_cert:
             os.environ["SSL_CERT_FILE"] = ssl_cert
-        else:
-            # 修复：不要设 E2B_DEBUG=true！会让 SDK 进入 debug 模式返回假 sandbox_id。
-            # 与 __init__/connect 保持一致，用 ssl 上下文跳过证书验证。
-            ssl._create_default_https_context = ssl._create_unverified_context
+        # 与 __init__/connect 一致：不设 E2B_DEBUG、不 monkeypatch ssl（对 httpx/httpcore 无效）。
 
         # 先查找已有的沙箱 —— 通过 metadata filter
         #   CubeAPI 的 filter_by_metadata 不会 URL-decode metadata value，
