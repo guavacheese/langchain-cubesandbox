@@ -52,8 +52,13 @@ class CubeSandbox(BaseSandbox):
         metadata: dict[str, str] | None = None,
         timeout: int | None = None,
         auto_pause: bool = True,
-        timeout_on_refresh: int = 300,
+        timeout_on_refresh: int | None = None,
     ) -> None:
+        # timeout_on_refresh 默认跟随 timeout（否则 refresh_timeout 会用默认 300
+        # 把创建时的 timeout 覆盖掉——2026-08-13 实测：创建 timeout=3600，
+        # 第一次 execute 前 refresh 就 set_timeout(300)，TTL 被打回 5 分钟）
+        if timeout_on_refresh is None:
+            timeout_on_refresh = timeout if timeout is not None else 300
         # 1. 预初始化所有属性，防止 __del__ 崩溃
         self._sandbox = None
         self._template = template
@@ -93,9 +98,12 @@ class CubeSandbox(BaseSandbox):
         api_key: str | None = None,
         ssl_cert: str | None = None,
         timeout: int | None = None,
-        timeout_on_refresh: int = 300,
+        timeout_on_refresh: int | None = None,
     ) -> "CubeSandbox":
         """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
+        # timeout_on_refresh 默认跟随 timeout（理由同 __init__）
+        if timeout_on_refresh is None:
+            timeout_on_refresh = timeout if timeout is not None else 300
         # 先用一个临时沙箱获取连接
         instance = cls.__new__(cls)
 
@@ -165,11 +173,15 @@ class CubeSandbox(BaseSandbox):
         api_key: str | None = None,
         ssl_cert: str | None = None,
         timeout: int = 300,
+        timeout_on_refresh: int | None = None,
     ) -> "CubeSandbox":
         """
         每次调用都创建新沙箱（带 thread_id 作为 metadata）。
         如果需要复用已有沙箱，外部自行管理 sandbox_id → thread_id 的映射。
+        timeout_on_refresh 默认跟随 timeout（理由同 __init__）。
         """
+        if timeout_on_refresh is None:
+            timeout_on_refresh = timeout
         if api_url:
             os.environ["E2B_API_URL"] = api_url
         if api_key:
@@ -217,6 +229,8 @@ class CubeSandbox(BaseSandbox):
                 api_url=api_url,
                 api_key=api_key,
                 ssl_cert=ssl_cert,
+                timeout=timeout,
+                timeout_on_refresh=timeout_on_refresh,
             )
 
         # Step 2: running 没找到，查 paused 沙箱
@@ -232,6 +246,8 @@ class CubeSandbox(BaseSandbox):
                     api_url=api_url,
                     api_key=api_key,
                     ssl_cert=ssl_cert,
+                    timeout=timeout,
+                    timeout_on_refresh=timeout_on_refresh,
                 )
                 # 尝试恢复暂停的沙箱（如果 connect 成功但沙箱仍处于 paused 状态）
                 try:
@@ -251,6 +267,7 @@ class CubeSandbox(BaseSandbox):
             ssl_cert=ssl_cert,
             metadata={"thread_id": thread_id},
             timeout=timeout,
+            timeout_on_refresh=timeout_on_refresh,
         )
 
     @property
