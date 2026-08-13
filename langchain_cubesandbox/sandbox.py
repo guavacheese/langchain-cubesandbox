@@ -1,6 +1,9 @@
 from __future__ import annotations
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from deepagents.backends.protocol import (
     ExecuteResponse,
@@ -75,8 +78,10 @@ class CubeSandbox(BaseSandbox):
         create_kwargs: dict[str, Any] = {"template": template}
         if metadata:
             create_kwargs["metadata"] = metadata
-        # if timeout is not None:
-        #     create_kwargs["timeout"] = timeout
+        # v0.6.0 起 CubeMaster/CubeAPI 支持创建沙箱时设置空闲回收 TTL（timeout）；
+        # SDK 默认 Config.timeout=300，此处显式透传调用方指定的值（-1 = never timeout）。
+        if timeout is not None:
+            create_kwargs["timeout"] = timeout
 
         self._sandbox = Sandbox.create(**create_kwargs)
 
@@ -159,7 +164,7 @@ class CubeSandbox(BaseSandbox):
         api_url: str | None = None,
         api_key: str | None = None,
         ssl_cert: str | None = None,
-        # timeout: int = 300,
+        timeout: int = 300,
     ) -> "CubeSandbox":
         """
         每次调用都创建新沙箱（带 thread_id 作为 metadata）。
@@ -245,7 +250,7 @@ class CubeSandbox(BaseSandbox):
             api_key=api_key,
             ssl_cert=ssl_cert,
             metadata={"thread_id": thread_id},
-            # timeout=timeout,
+            timeout=timeout,
         )
 
     @property
@@ -260,14 +265,17 @@ class CubeSandbox(BaseSandbox):
     # ─── TTL 管理 ───
 
     def set_timeout(self, seconds: int) -> None:
-        """设置超时时间（秒），超时后沙箱自动销毁。"""
+        """设置超时时间（秒），超时后沙箱自动销毁。
+
+        v0.6.0 起 CubeMaster 实现了 POST /sandboxes/:id/timeout 接口，
+        续期调用真正下发到后端（重置空闲时钟 + 重设 TTL）。
+        """
         self._timeout = seconds
 
-        # 可选：如果后端未来支持，再调用
-        # try:
-        #     self._sandbox.set_timeout(seconds)
-        # except Exception:
-        #     pass
+        try:
+            self._sandbox.set_timeout(seconds)
+        except Exception as e:
+            logger.warning("set_timeout failed: seconds=%s err=%s", seconds, e)
 
     def refresh_timeout(self) -> None:
         """续期 TTL（默认 300 秒 = 5 分钟）。"""
@@ -296,8 +304,8 @@ class CubeSandbox(BaseSandbox):
             # 尝试续期 TTL，失败也不影响代码执行
             try:
                 self.refresh_timeout()
-            except Exception:
-                pass  # CubeMaster 可能还没实现 timeout 接口
+            except Exception as e:
+                logger.warning("refresh_timeout failed: %s", e)
 
             # 标准 E2B SDK 的 shell 命令执行入口
             result = self._sandbox.commands.run(
