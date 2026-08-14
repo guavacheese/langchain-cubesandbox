@@ -66,6 +66,8 @@ class CubeSandbox(BaseSandbox):
         self._timeout_on_refresh = timeout_on_refresh
         self._auto_pause = auto_pause
         self._closed = False
+        # 保存 metadata（含 thread_id），供沙箱被回收后自动重建（130404）使用
+        self._metadata = dict(metadata or {})
 
         # 2. CubeSandbox 通过环境变量拦截 E2B SDK 请求
         if api_url:
@@ -99,6 +101,7 @@ class CubeSandbox(BaseSandbox):
         ssl_cert: str | None = None,
         timeout: int | None = None,
         timeout_on_refresh: int | None = None,
+        metadata: dict[str, str] | None = None,
     ) -> "CubeSandbox":
         """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
         # timeout_on_refresh 默认跟随 timeout（理由同 __init__）
@@ -114,6 +117,8 @@ class CubeSandbox(BaseSandbox):
         instance._timeout_on_refresh = timeout_on_refresh
         instance._auto_pause = True
         instance._closed = False
+        # 保存 metadata（含 thread_id），供沙箱被回收后自动重建（130404）使用
+        instance._metadata = dict(metadata or {})
 
         if api_url:
             os.environ["E2B_API_URL"] = api_url
@@ -231,6 +236,7 @@ class CubeSandbox(BaseSandbox):
                 ssl_cert=ssl_cert,
                 timeout=timeout,
                 timeout_on_refresh=timeout_on_refresh,
+                metadata={"thread_id": thread_id},
             )
 
         # Step 2: running 没找到，查 paused 沙箱
@@ -248,6 +254,7 @@ class CubeSandbox(BaseSandbox):
                     ssl_cert=ssl_cert,
                     timeout=timeout,
                     timeout_on_refresh=timeout_on_refresh,
+                    metadata={"thread_id": thread_id},
                 )
                 # 尝试恢复暂停的沙箱（如果 connect 成功但沙箱仍处于 paused 状态）
                 try:
@@ -294,9 +301,46 @@ class CubeSandbox(BaseSandbox):
         except Exception as e:
             logger.warning("set_timeout failed: seconds=%s err=%s", seconds, e)
 
+    def _is_sandbox_missing(self, exc: Exception) -> bool:
+        """判断异常是否为"沙箱不存在"（CubeMaster 130404 / SDK not found）。"""
+        s = str(exc)
+        return "130404" in s or "sandbox id not found" in s.lower()
+
+    def _rebuild(self) -> bool:
+        """沙箱被回收/误删（130404）时自动重建，替换底层连接。返回是否成功。
+
+        沙箱是无状态计算容器（状态在宿主 /uploads、/reports、DB），
+        丢失后重建成本秒级——上层任务不应因沙箱回收而中断。
+        """
+        tid = (self._metadata or {}).get("thread_id")
+        if not tid or not self._template:
+            logger.warning("sandbox rebuild skipped: 缺 template/thread_id")
+            return False
+        try:
+            new = CubeSandbox.get_or_create(
+                template=self._template,
+                thread_id=tid,
+                timeout=self._timeout,
+                timeout_on_refresh=self._timeout_on_refresh,
+            )
+            self._sandbox = new._sandbox
+            self._closed = False
+            logger.warning("sandbox(thread=%s) 已回收，已自动重建", tid)
+            return True
+        except Exception as e:
+            logger.warning("sandbox rebuild failed: %s", e)
+            return False
+
     def refresh_timeout(self) -> None:
-        """续期 TTL（默认 300 秒 = 5 分钟）。"""
-        self._sandbox.set_timeout(self._timeout_on_refresh)
+        """续期 TTL（默认 300 秒 = 5 分钟）；沙箱不存在时自动重建后续期。"""
+        try:
+            self._sandbox.set_timeout(self._timeout_on_refresh)
+        except Exception as e:
+            if self._is_sandbox_missing(e) and self._rebuild():
+                # 重建后重试一次续期
+                self._sandbox.set_timeout(self._timeout_on_refresh)
+            else:
+                raise
 
     # ─── Pause / Resume ───
 
@@ -324,11 +368,21 @@ class CubeSandbox(BaseSandbox):
             except Exception as e:
                 logger.warning("refresh_timeout failed: %s", e)
 
-            # 标准 E2B SDK 的 shell 命令执行入口
-            result = self._sandbox.commands.run(
-                command,
-                timeout=timeout or self._timeout_on_refresh,
-            )
+            # 标准 E2B SDK 的 shell 命令执行入口；沙箱不存在时自动重建并重试一次
+            try:
+                result = self._sandbox.commands.run(
+                    command,
+                    timeout=timeout or self._timeout_on_refresh,
+                )
+            except Exception as e:
+                if self._is_sandbox_missing(e) and self._rebuild():
+                    logger.warning("execute: 沙箱已回收，已自动重建，重试命令")
+                    result = self._sandbox.commands.run(
+                        command,
+                        timeout=timeout or self._timeout_on_refresh,
+                    )
+                else:
+                    raise
 
             output = result.stdout or ""
 
@@ -475,21 +529,33 @@ class CubeSandbox(BaseSandbox):
     # ─── 资源释放 ───
 
     def close(self) -> None:
-        """显式关闭 CubeSandbox MicroVM 实例，释放资源。"""
+        """关闭连接（不销毁沙箱）：仅标记已关闭，沙箱生命周期由平台空闲 TTL 回收。
+
+        2026-08-14 修复：原实现在对象被 GC 时经 __del__ → close() → e2b close()/kill()
+        直接 DELETE 沙箱，导致沙箱在活跃使用中被误杀（execute 全 504）。现在 close 只
+        断开本实例引用，沙箱本体保留供 get_or_create 复用或由平台 TTL 自然回收。
+        """
+        self._closed = True
+
+    def destroy(self) -> None:
+        """显式销毁沙箱（调用方明确要求时才使用）：kill 掉 MicroVM。"""
         if self._closed:
             return
-
         sandbox = getattr(self, "_sandbox", None)
         if sandbox is not None:
-            if hasattr(sandbox, "close"):
-                sandbox.close()
-            elif hasattr(sandbox, "kill"):
-                sandbox.kill()
-
+            try:
+                if hasattr(sandbox, "kill"):
+                    sandbox.kill()
+                elif hasattr(sandbox, "close"):
+                    sandbox.close()
+            except Exception as e:
+                logger.warning("destroy failed: %s", e)
         self._closed = True
 
     def __del__(self) -> None:
+        # 仅标记关闭，不销毁沙箱——对象被 GC 不应导致沙箱被删
+        # （2026-08-14 实测：__del__ 调 close → e2b kill → 活跃沙箱被 DELETE，后续 execute 全 504）
         try:
-            self.close()
+            self._closed = True
         except Exception:
             pass  # 析构时禁止任何异常逃逸
