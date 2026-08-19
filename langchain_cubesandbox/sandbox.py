@@ -102,6 +102,7 @@ class CubeSandbox(BaseSandbox):
         timeout: int | None = None,
         timeout_on_refresh: int | None = None,
         metadata: dict[str, str] | None = None,
+        template: str | None = None,
     ) -> "CubeSandbox":
         """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
         # timeout_on_refresh 默认跟随 timeout（理由同 __init__）
@@ -112,7 +113,10 @@ class CubeSandbox(BaseSandbox):
 
         # 预初始化所有属性，保持一致性
         instance._sandbox = None
-        instance._template = ""
+        # 注意：template 必须保存——沙箱被 TTL 回收后 _rebuild 依赖它重建
+        # （2026-08-19 实测：get_or_create 复用 running 旧沙箱走 connect 分支，
+        #  _template 空 → 130404 后 rebuild skipped '缺 template' → execute 5 连败）
+        instance._template = template or ""
         instance._timeout = timeout
         instance._timeout_on_refresh = timeout_on_refresh
         instance._auto_pause = True
@@ -237,6 +241,7 @@ class CubeSandbox(BaseSandbox):
                 timeout=timeout,
                 timeout_on_refresh=timeout_on_refresh,
                 metadata={"thread_id": thread_id},
+                template=template,
             )
 
         # Step 2: running 没找到，查 paused 沙箱
@@ -255,6 +260,7 @@ class CubeSandbox(BaseSandbox):
                     timeout=timeout,
                     timeout_on_refresh=timeout_on_refresh,
                     metadata={"thread_id": thread_id},
+                    template=template,
                 )
                 # 尝试恢复暂停的沙箱（如果 connect 成功但沙箱仍处于 paused 状态）
                 try:
