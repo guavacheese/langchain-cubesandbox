@@ -1,9 +1,81 @@
 from __future__ import annotations
 import logging
 import os
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ─── e2b CA 局部注入（2026-09-09 根治全局 SSL_CERT_FILE 污染）────────────────
+# 旧实现把 ssl_cert 写进 os.environ["SSL_CERT_FILE"]（进程级全局变量），污染同进程
+# 其他 httpx 客户端：后端 ChatOpenAI/openai 访问公网 api.deepseek.com 时被内网 mkcert
+# CA 校验 → CERTIFICATE_VERIFY_FAILED（Linux 上 SSL_CERT_FILE 一设即只信该文件，
+# 系统正规 CA 全被忽略）。
+# 为什么不能用"C 方案（建连后恢复 env）"：e2b transport 是惰性创建（首次真实请求
+# 才 new）+ 线程级缓存（e2b/api/client_sync/__init__.py get_transport →
+# TransportWithLogger._thread_local），首个请求发生在恢复之后 → e2b 自己连内网 Cube
+# 会退回系统 CA 而失败。所以 env 必须在进程生命周期内持续有效 = 必然全局污染。
+# 根治：给 e2b 的 transport 类打子类补丁，构造时强制 verify=「仅含内网 CA」的
+# SSLContext——只影响 e2b 自身连接（控制面 + envd 数据面），不再碰全局 env。
+# patch 类而非函数的原因：e2b 各子模块（commands/filesystem/paginator/template/volume）
+# 以 `from e2b.api.client_sync import get_envd_transport` 形式固化绑定函数，
+# patch 模块函数对它们无效；但它们最终 new 的都是模块全局 transport 类 → 类级 patch
+# 全局生效。
+_e2b_ca_patched = False
+_e2b_ca_lock = threading.Lock()
+
+
+def _install_e2b_ca(ssl_cert: str | None) -> None:
+    """让 e2b 的 HTTP transport 只信任 ssl_cert 指向的内网 CA（局部，非全局 env）。
+
+    幂等：进程内只 patch 一次（加锁 + 标志位）。ssl_cert 为空/文件不存在 → 跳过
+    （e2b 保持 verify=True 默认，与旧实现 `if ssl_cert:` 不触发时行为一致）。
+    e2b 版本升级导致类名不匹配 → warning 提示，不阻断（此时 e2b 回落默认校验，
+    不写全局 env，不产生污染）。
+    """
+    global _e2b_ca_patched
+    if _e2b_ca_patched:
+        return
+    if not ssl_cert or not os.path.isfile(ssl_cert):
+        return
+    try:
+        import ssl
+
+        import e2b.api.client_async as _e2b_async
+        import e2b.api.client_sync as _e2b_sync
+
+        ctx = ssl.create_default_context(cafile=ssl_cert)
+
+        def _verify_subclass(base, ca_ctx: ssl.SSLContext):
+            class _VerifyTransport(base):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(verify=ca_ctx, *args, **kwargs)
+
+            _VerifyTransport.__name__ = f"{base.__name__}WithLocalCA"
+            return _VerifyTransport
+
+        with _e2b_ca_lock:
+            if _e2b_ca_patched:
+                return
+            patched: list[str] = []
+            for _mod, _names in (
+                (_e2b_sync, ("TransportWithLogger", "EnvdTransportWithLogger")),
+                (
+                    _e2b_async,
+                    ("AsyncTransportWithLogger", "AsyncEnvdTransportWithLogger"),
+                ),
+            ):
+                for _cls_name in _names:
+                    _orig = getattr(_mod, _cls_name, None)
+                    if _orig is not None:
+                        setattr(_mod, _cls_name, _verify_subclass(_orig, ctx))
+                        patched.append(f"{_mod.__name__}.{_cls_name}")
+            _e2b_ca_patched = True
+            if patched:
+                logger.info("e2b transport CA 已局部注入 (%s): %s", ", ".join(patched), ssl_cert)
+    except Exception as e:  # noqa: BLE001
+        # 不抛：patch 失败仅意味着 e2b 回落默认证书校验（不写全局 env，无污染）
+        logger.warning("e2b CA 局部注入失败（回落默认校验，未写全局 env）: %s", e)
 
 from deepagents.backends.protocol import (
     ExecuteResponse,
@@ -69,17 +141,20 @@ class CubeSandbox(BaseSandbox):
         # 保存 metadata（含 thread_id），供沙箱被回收后自动重建（130404）使用
         self._metadata = dict(metadata or {})
 
-        # 2. CubeSandbox 通过环境变量拦截 E2B SDK 请求
+        # 2. CubeSandbox 通过环境变量拦截 E2B SDK 请求（E2B_API_URL/E2B_API_KEY
+        #    为 e2b 专属变量，其他库不读，无污染；仅保留这两个）
         if api_url:
             os.environ["E2B_API_URL"] = api_url
         if api_key:
             os.environ["E2B_API_KEY"] = api_key
-        if ssl_cert:
-            os.environ["SSL_CERT_FILE"] = ssl_cert
+        # 3. 内网 CA 只注入 e2b transport（局部 SSLContext）——不再写全局
+        #    SSL_CERT_FILE（2026-09-09 根治：全局 env 会污染同进程 openai/httpx
+        #    访问公网 API，见 _install_e2b_ca 注释）
+        _install_e2b_ca(ssl_cert)
         # 注意：不要设 E2B_DEBUG=true！会让 SDK 进入 debug 模式返回假 sandbox_id。
         # 也不要 monkeypatch ssl._create_default_https_context——它只对 http.client/urllib 生效，
         # e2b 用的 httpx/httpcore 直接调用 ssl.create_default_context()，替换无效。
-        # 证书验证靠 .env 的 SSL_CERT_FILE 指向内部 CA（或公网合法证书）。
+        # 证书验证：e2b transport 由 _install_e2b_ca 局部注入内部 CA（或公网合法证书）。
 
         # 传给SDK的kwargs
         create_kwargs: dict[str, Any] = {"template": template}
@@ -128,9 +203,9 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_URL"] = api_url
         if api_key:
             os.environ["E2B_API_KEY"] = api_key
-        if ssl_cert:
-            os.environ["SSL_CERT_FILE"] = ssl_cert
+        _install_e2b_ca(ssl_cert)
         # 与 __init__ 一致：不设 E2B_DEBUG、不 monkeypatch ssl（对 httpx/httpcore 无效）。
+        # 证书验证走 _install_e2b_ca 的局部 transport 注入。
 
         try:
             instance._sandbox = Sandbox.connect(sandbox_id, timeout=timeout)
@@ -195,8 +270,7 @@ class CubeSandbox(BaseSandbox):
             os.environ["E2B_API_URL"] = api_url
         if api_key:
             os.environ["E2B_API_KEY"] = api_key
-        if ssl_cert:
-            os.environ["SSL_CERT_FILE"] = ssl_cert
+        _install_e2b_ca(ssl_cert)
         # 与 __init__/connect 一致：不设 E2B_DEBUG、不 monkeypatch ssl（对 httpx/httpcore 无效）。
 
         # 先查找已有的沙箱 —— 通过 metadata filter
