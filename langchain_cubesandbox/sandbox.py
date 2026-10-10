@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import threading
@@ -590,21 +591,48 @@ class CubeSandbox(BaseSandbox):
         *,
         timeout: int | None = None,
     ) -> ExecuteResponse:
-        # E2B SDK 在 async 上下文通常自动支持 async，或提供 aexecute / commands.arun
-        # 若 SDK 暂不支持真 async，可先同步 fallback，后续迭代优化
-        return self.execute(command, timeout=timeout)
+        """异步版 execute：**必须走线程池**，不得同步直调。
+
+        2026-10-10 修复（生产 P0）：本方法原实现是
+        ``return self.execute(command, timeout=timeout)`` —— 在 ``async def`` 里
+        同步调用阻塞的 e2b SDK，**把整个事件循环占死**。调用链是
+        deepagents 的 execute 工具 → ``CompositeBackend.aexecute``
+        （deepagents/backends/composite.py:588）→ 本方法。agent 服务是单个
+        uvicorn worker（单事件循环），于是一条长命令（execute 的 timeout 上限
+        600s）会冻住**全部会话，连 /healthz 都不响应** —— swarm healthcheck
+        （30s×5）随后判 unhealthy 并发 SIGKILL（`task: non-zero exit (137):
+        dockerexec: unhealthy container`），重启后又冻，形成重启循环。
+        现场实证：容器内裸 TCP 连 127.0.0.1:8009 仅 3ms 成功，而同进程
+        ``GET /healthz`` 连续 3 次 8.008s 超时（端口在听/accept 正常，
+        但请求进不了事件循环）；时间线与「模型决定调 execute 跑 150 页 OCR」
+        严格吻合。
+
+        注意这不是"可选的优化"：deepagents 上游 ``BackendProtocol.aexecute``
+        的默认实现（deepagents/backends/protocol.py:860）本来就是
+        ``await asyncio.to_thread(self.execute, ...)``；本类覆写默认实现时丢掉
+        了 ``to_thread`` —— 即与上游语义的偏差，而非取舍。
+
+        线程安全依据（2026-10-10 实测，10 PASS / 0 FAIL）：同一 CubeSandbox
+        对象 8 路线程并发 ``execute``（各带唯一标记）全部 exit_code=0、无异常、
+        **无串台**，总耗时 3.26s vs 串行估算 25.64s；并发 ``execute`` +
+        ``upload_files`` 混合亦全绿，风暴后沙箱仍可正常 execute。故**不需要**
+        per-sandbox 锁（加锁会白白牺牲同一沙箱内的并发度）。
+        """
+        return await asyncio.to_thread(self.execute, command, timeout=timeout)
 
     async def aupload_files(
         self,
         files: list[tuple[str, bytes]],
     ) -> list[FileUploadResponse]:
-        return self.upload_files(files)
+        """异步版 upload_files：同上，必须走线程池（大文件上传同样是长阻塞）。"""
+        return await asyncio.to_thread(self.upload_files, files)
 
     async def adownload_files(
         self,
         paths: list[str],
     ) -> list[FileDownloadResponse]:
-        return self.download_files(paths)
+        """异步版 download_files：同上，必须走线程池。"""
+        return await asyncio.to_thread(self.download_files, paths)
 
     # ─── 资源释放 ───
 
