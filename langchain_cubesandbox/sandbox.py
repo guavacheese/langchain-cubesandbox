@@ -92,6 +92,13 @@ from e2b_code_interpreter import (
     SandboxState,
 )
 
+try:
+    # e2b 对「命令非零退出」抛这个异常，而不是返回带 exit_code 的结果对象。
+    # 它**同时携带** stdout / stderr / exit_code 三个字段。
+    from e2b.sandbox.commands.command_handle import CommandExitException
+except ImportError:  # pragma: no cover - 老版本 e2b 无此异常
+    CommandExitException = ()  # type: ignore[assignment]
+
 
 def _metadata_may_mismatch(value: str) -> bool:
     """CubeAPI filter_by_metadata 不做 URL-decode。
@@ -455,6 +462,15 @@ class CubeSandbox(BaseSandbox):
                     command,
                     timeout=timeout or self._timeout_on_refresh,
                 )
+            except CommandExitException as e:
+                # 命令「非零退出」是**正常结果**，不是沙箱故障。
+                # e2b 的 CommandExitException.__str__ 只输出 stderr，
+                # 而很多失败原因写在 stdout（如 deepagents write_file preflight 的
+                # "Error: File already exists: '<path>'"）—— 原实现落到最外层
+                # except 后只剩 "Execution error:Command exited with code 1 and error:"，
+                # stdout 全丢，调用方（乃至 LLM）拿不到任何可诊断信息。
+                # 这里还原 stdout/stderr/exit_code 三件套。
+                return self._response_from_exit(e.stdout, e.stderr, e.exit_code)
             except Exception as e:
                 if self._is_sandbox_missing(e) and self._rebuild():
                     logger.warning("execute: 沙箱已回收，已自动重建，重试命令")
@@ -465,14 +481,10 @@ class CubeSandbox(BaseSandbox):
                 else:
                     raise
 
-            output = result.stdout or ""
-
-            if result.stderr:
-                output += f"\n<stderr>{result.stderr}</stderr>"
-
-            return ExecuteResponse(
-                output=output,
-                exit_code=result.exit_code or 0,
+            return self._response_from_exit(
+                result.stdout,
+                result.stderr,
+                result.exit_code or 0,
                 truncated=getattr(result, "truncated", False),
             )
         except Exception as e:
@@ -482,6 +494,35 @@ class CubeSandbox(BaseSandbox):
                 exit_code=1,
                 truncated=False,
             )
+
+    @staticmethod
+    def _response_from_exit(
+        stdout: str | None,
+        stderr: str | None,
+        exit_code: int | None,
+        *,
+        truncated: bool = False,
+    ) -> ExecuteResponse:
+        """把 (stdout, stderr, exit_code) 组装成 ExecuteResponse，并保证 output 非空。
+
+        对齐 deer-flow `community/e2b_sandbox/e2b_sandbox.py:155-168`
+        （boxlite / opensandbox / tenki 四个后端同一写法）：
+          1. stdout 与 stderr 都有 → 换行拼接；只有一个 → 取它；
+          2. 非零退出且**确实没有输出** → 补 "Command exited with code N"；
+          3. 仍为空 → 补 "(no output)"。
+        第 2/3 条保证调用方永远拿不到空字符串——空输出会让上层误判为「什么都没发生」。
+        """
+        output = stdout or ""
+        if stderr:
+            output += f"\n<stderr>{stderr}</stderr>"
+        output = output.strip()
+        if exit_code not in (0, None) and not output:
+            output = f"Command exited with code {exit_code}"
+        return ExecuteResponse(
+            output=output or "(no output)",
+            exit_code=exit_code or 0,
+            truncated=truncated,
+        )
 
     def run_code(self, code: str, *, timeout: int | None = None):
         """运行 Python等 代码（直接转 E2B SDK 的 run_code）。"""
