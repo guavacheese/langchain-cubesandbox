@@ -7,6 +7,14 @@ requires-python = ">=3.13"
 dependencies = [
     "deepagents>=0.5.9",
     "e2b-code-interpreter>=2.6.2",
+    # ⚠ 永久 pin（2026-11-20 生产事故）：e2b ≥2.51 把创建端点从 POST /sandboxes(v1)
+    # 改成 POST /v2/sandboxes，而 CubeSandbox v0.6.0 cube-api 未实现 v2 创建（405 空体）
+    # ⇒ 全站沙箱创建瘫痪（1.0.53-1.0.55 中招，e2b 2.64.0）。2.50.0 = 最后一个
+    # create/connect 均走 v1 的版本（v1 为 1.0.52 前生产验证路径）；且其 wcmatch<12
+    # 兼容 deepagents 0.7.x（2.32.0 的 wcmatch<11 与 deepagents>=0.7 冲突，不可回更旧）。
+    # 升级 e2b 前必须先确认服务端已支持 v2 create（body 字段 v1=templateID /
+    # v2=template_id，不能纯 nginx rewrite）。
+    "e2b==2.50.0",
     "python-dotenv>=1.2.2",
 ]
 
