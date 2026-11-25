@@ -78,6 +78,66 @@ def _install_e2b_ca(ssl_cert: str | None) -> None:
         # 不抛：patch 失败仅意味着 e2b 回落默认证书校验（不写全局 env，无污染）
         logger.warning("e2b CA 局部注入失败（回落默认校验，未写全局 env）: %s", e)
 
+# ─── lifecycle wire 兼容层（2026-11-25 真平台 e2e 实锤的静默失效）───────────
+# 现象：Sandbox.create(lifecycle={"on_timeout":"pause"}) 建出的沙箱 TTL 到期
+# 仍被 kill，pause 配置全程无声无效。
+# 根因（两侧源码+抓包铁证）：e2b SDK（2.50 线）把 lifecycle 序列化成**平铺**
+# 字段 {"autoPause": true, "autoResume": {"enabled": bool}}；而 CubeAPI 的
+# NewSandbox（CubeAPI/src/models/mod.rs:172-184）声明的是**嵌套**对象
+# lifecycle:{onTimeout,autoResume}，serde 对未声明的平铺字段静默忽略 →
+# 策略根本没进 CubeMaster。SDK 透传单测（test_lifecycle_passthrough）桩掉了
+# create，断言的是 kwargs 形态，看不到 wire 层——正是这类"透传≠落地"盲区。
+# 修复落点：CubeSandbox 自有层（用户明令不 fork CubeSandbox/e2b 源码，防
+# 升级不兼容）。patch 点选 NewSandbox.to_dict——e2b 生成式 API client 的
+# body 序列化唯一出口，spike（2026-11-25，agent 容器内 E2B_API_URL 指向
+# 桩服务器抓真实请求体）实证补丁后 wire 携带嵌套 lifecycle 且平铺字段清除。
+# 语义：autoPause=true → lifecycle:{onTimeout:"pause", autoResume:enabled}；
+# autoPause=false/缺省 → **不加** lifecycle 键（缺省即 kill，与改造前 wire
+# 语义等价，未开 pause 的流量形态最小变化）。
+_e2b_wire_patched = False
+_e2b_wire_lock = threading.Lock()
+
+
+def _install_lifecycle_wire_compat() -> None:
+    """把 lifecycle 的 SDK 平铺 wire 形态翻译成 CubeAPI 认的嵌套形态。
+
+    幂等（锁+标志位+函数属性三重）。e2b 升级导致类/方法名变化 → error 日志
+    （不抛）：此时行为回落到"pause 静默失效"＝本 patch 之前的已知现状，
+    不产生新故障面，但 P0 依赖方必须能从 error 日志立刻察觉。
+    """
+    global _e2b_wire_patched
+    if _e2b_wire_patched:
+        return
+    try:
+        from e2b.api.client.models.new_sandbox import NewSandbox
+
+        with _e2b_wire_lock:
+            if _e2b_wire_patched:
+                return
+            if getattr(NewSandbox.to_dict, "_geesun_wire_compat", False):
+                # 极端情形：模块重载但模块级标志位复位——函数属性仍在即视为已打
+                _e2b_wire_patched = True
+                return
+            orig = NewSandbox.to_dict
+
+            def patched(self):  # noqa: ANN001
+                d = orig(self)
+                ap = d.pop("autoPause", None)
+                d.pop("autoPauseMemory", None)
+                ar = d.pop("autoResume", None)
+                if ap is True:
+                    enabled = bool(ar.get("enabled")) if isinstance(ar, dict) else False
+                    d["lifecycle"] = {"onTimeout": "pause", "autoResume": enabled}
+                return d
+
+            patched._geesun_wire_compat = True  # type: ignore[attr-defined]
+            NewSandbox.to_dict = patched
+            _e2b_wire_patched = True
+            logger.info("e2b lifecycle wire 兼容层已注入（autoPause 平铺 → lifecycle 嵌套）")
+    except Exception as e:  # noqa: BLE001
+        # error 级：pause 是 P0 能力，静默回退成 kill 必须可见，不允许 warning 淹没
+        logger.error("e2b lifecycle wire 兼容层注入失败（pause 将静默失效，回退 kill）: %s", e)
+
 from deepagents.backends.protocol import (
     ExecuteResponse,
     FileDownloadResponse,
@@ -133,6 +193,7 @@ class CubeSandbox(BaseSandbox):
         timeout: int | None = None,
         auto_pause: bool = True,
         timeout_on_refresh: int | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ) -> None:
         # timeout_on_refresh 默认跟随 timeout（否则 refresh_timeout 会用默认 300
         # 把创建时的 timeout 覆盖掉——2026-08-13 实测：创建 timeout=3600，
@@ -148,6 +209,10 @@ class CubeSandbox(BaseSandbox):
         self._closed = False
         # 保存 metadata（含 thread_id），供沙箱被回收后自动重建（130404）使用
         self._metadata = dict(metadata or {})
+        # 保存 lifecycle（2026-11-25 资源分档 P0）：{"on_timeout": "pause",
+        # "auto_resume": bool}——TTL 到期 pause 而非 kill。_rebuild 重建时沿用，
+        # 否则回收重建一次就把 pause 策略静默降级回 kill。
+        self._lifecycle = dict(lifecycle) if lifecycle else None
 
         # 2. CubeSandbox 通过环境变量拦截 E2B SDK 请求（E2B_API_URL/E2B_API_KEY
         #    为 e2b 专属变量，其他库不读，无污染；仅保留这两个）
@@ -159,6 +224,10 @@ class CubeSandbox(BaseSandbox):
         #    SSL_CERT_FILE（2026-09-09 根治：全局 env 会污染同进程 openai/httpx
         #    访问公网 API，见 _install_e2b_ca 注释）
         _install_e2b_ca(ssl_cert)
+        # 4. lifecycle wire 兼容层（2026-11-25）：e2b SDK 把 lifecycle 平铺成
+        #    autoPause 发出，CubeAPI 只认嵌套 lifecycle 对象——不翻译则 pause
+        #    静默失效（真平台抓包实锤）。必须在任何 Sandbox.create 之前注入。
+        _install_lifecycle_wire_compat()
         # 注意：不要设 E2B_DEBUG=true！会让 SDK 进入 debug 模式返回假 sandbox_id。
         # 也不要 monkeypatch ssl._create_default_https_context——它只对 http.client/urllib 生效，
         # e2b 用的 httpx/httpcore 直接调用 ssl.create_default_context()，替换无效。
@@ -172,6 +241,12 @@ class CubeSandbox(BaseSandbox):
         # SDK 默认 Config.timeout=300，此处显式透传调用方指定的值（-1 = never timeout）。
         if timeout is not None:
             create_kwargs["timeout"] = timeout
+        # lifecycle：SDK 侧收 {"on_timeout": "pause", "auto_resume": bool}，
+        # 但它在 wire 层发的是平铺 autoPause，CubeAPI 只认嵌套 lifecycle——
+        # 由 _install_lifecycle_wire_compat 在 to_dict 出口翻译（见其注释）。
+        # None 时不传，保持服务端默认 kill 行为不变。
+        if lifecycle:
+            create_kwargs["lifecycle"] = lifecycle
 
         self._sandbox = Sandbox.create(**create_kwargs)
 
@@ -186,6 +261,7 @@ class CubeSandbox(BaseSandbox):
         timeout_on_refresh: int | None = None,
         metadata: dict[str, str] | None = None,
         template: str | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ) -> "CubeSandbox":
         """连接到一个已有的沙箱（用于 resume 或跨进程复用）。"""
         # timeout_on_refresh 默认跟随 timeout（理由同 __init__）
@@ -206,6 +282,8 @@ class CubeSandbox(BaseSandbox):
         instance._closed = False
         # 保存 metadata（含 thread_id），供沙箱被回收后自动重建（130404）使用
         instance._metadata = dict(metadata or {})
+        # 同 __init__：pause 策略随实例保存，_rebuild 重建时不静默丢（P0）
+        instance._lifecycle = dict(lifecycle) if lifecycle else None
 
         if api_url:
             os.environ["E2B_API_URL"] = api_url
@@ -266,11 +344,14 @@ class CubeSandbox(BaseSandbox):
         ssl_cert: str | None = None,
         timeout: int = 300,
         timeout_on_refresh: int | None = None,
+        lifecycle: dict[str, Any] | None = None,
     ) -> "CubeSandbox":
         """
         每次调用都创建新沙箱（带 thread_id 作为 metadata）。
         如果需要复用已有沙箱，外部自行管理 sandbox_id → thread_id 的映射。
         timeout_on_refresh 默认跟随 timeout（理由同 __init__）。
+        lifecycle（P0，2026-11-25）：{"on_timeout": "pause", "auto_resume": bool}
+        透传给创建端点；复用/paused-resume 分支仅保存供 _rebuild 沿用。
         """
         if timeout_on_refresh is None:
             timeout_on_refresh = timeout
@@ -324,6 +405,7 @@ class CubeSandbox(BaseSandbox):
                 timeout_on_refresh=timeout_on_refresh,
                 metadata={"thread_id": thread_id},
                 template=template,
+                lifecycle=lifecycle,
             )
 
         # Step 2: running 没找到，查 paused 沙箱
@@ -343,6 +425,7 @@ class CubeSandbox(BaseSandbox):
                     timeout_on_refresh=timeout_on_refresh,
                     metadata={"thread_id": thread_id},
                     template=template,
+                    lifecycle=lifecycle,
                 )
                 # 尝试恢复暂停的沙箱（如果 connect 成功但沙箱仍处于 paused 状态）
                 try:
@@ -363,6 +446,7 @@ class CubeSandbox(BaseSandbox):
             metadata={"thread_id": thread_id},
             timeout=timeout,
             timeout_on_refresh=timeout_on_refresh,
+            lifecycle=lifecycle,
         )
 
     @property
@@ -410,6 +494,9 @@ class CubeSandbox(BaseSandbox):
                 thread_id=tid,
                 timeout=self._timeout,
                 timeout_on_refresh=self._timeout_on_refresh,
+                # pause 策略必须随重建沿用（P0）：漏传 = 回收重建一次就把
+                # on_timeout=pause 静默降级回服务端默认 kill，且无从察觉。
+                lifecycle=self._lifecycle,
             )
             self._sandbox = new._sandbox
             self._closed = False
@@ -437,8 +524,41 @@ class CubeSandbox(BaseSandbox):
         self._sandbox.pause()
 
     def resume(self) -> None:
-        """恢复已暂停的沙箱。"""
-        self._sandbox.resume()
+        """恢复已暂停的沙箱。
+
+        ⚠ e2b SDK 2.50（本仓 pin 的版本）**没有 Sandbox.resume()**——生产
+        容器 hasattr 实测 + 2026-11-25 真平台 e2e 唤醒 paused 沙箱时当场
+        AttributeError（get_or_create 里被 except pass 吞掉才一直没暴露）。
+        唤醒语义由类方法 connect 承担：POST /sandboxes/:id/connect 把
+        paused→running 并重设 TTL（真机 raw HTTP 实证 connect 后 state
+        =running 且 commands.run 正常）。
+        句柄必须换成新连接对象：pause 之前的旧句柄不能继续用（恢复后
+        envd 会话状态已换）。
+        """
+        self._sandbox = Sandbox.connect(
+            self._sandbox.sandbox_id,
+            timeout=self._timeout_on_refresh,
+        )
+
+    def is_alive(self) -> bool:
+        """探活：沙箱当前是否 running（阻塞 ~1 次数据面 HTTP）。
+
+        背景（2026-11-25 geesun_test e2e 实测）：pause 模式下平台把 TTL 到期的
+        箱转 paused，但上层进程级缓存（geesun_agent `_sandbox_cache`）仍持有旧
+        句柄——不探活直接复用会让 execute 报 `service unavailable`（箱明明可
+        唤醒，agent 却抱着死句柄）。调用方对 False 应逐出缓存改走 get_or_create
+        （其 paused 分支会 connect 唤醒，running 分支原样复用，不存在误重建）。
+
+        ⚠ paused 时 SDK `is_running()` 的行为不是返回 False 而是**抛
+        SandboxException 503**（SDK 源码只对 502 返回 False；CubeAPI 数据面
+        代理回的是 503——agent 容器内 spike 实证）。故异常一律判 False。
+        网络抖动误判 False 无副作用：get_or_create 查到 running 仍复用原箱。
+        """
+        try:
+            return bool(self._sandbox.is_running())
+        except Exception as e:  # noqa: BLE001 —— paused/已销毁/网络故障都按非活处理
+            logger.debug("is_alive 探活未通过（按非活处理）: %s", e)
+            return False
 
     # ─── 代码执行 ───
 
